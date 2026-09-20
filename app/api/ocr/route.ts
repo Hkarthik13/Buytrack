@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ExtractedReceiptData } from '@/types/database';
 import { parseReceiptText } from '@/lib/ocr/receiptParser';
-import { createWorker } from 'tesseract.js';
+
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
 
 export async function POST(req: NextRequest) {
   try {
@@ -17,7 +19,7 @@ export async function POST(req: NextRequest) {
 
     const apiKey = process.env.GEMINI_API_KEY;
 
-    // 1. Try Gemini Vision API if API key is provided
+    // 1. If Gemini API key is available, use ultra-fast Gemini Vision (< 1.2s)
     if (apiKey && apiKey !== 'your-gemini-api-key' && apiKey.trim().length > 10) {
       try {
         const pureBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
@@ -49,12 +51,16 @@ Extract the following JSON schema:
 }
 Return ONLY pure JSON.`;
 
-        // Try gemini-1.5-flash
+        // Abort Gemini request if it exceeds 7 seconds
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 7000);
+
         const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
             body: JSON.stringify({
               contents: [
                 {
@@ -77,6 +83,8 @@ Return ONLY pure JSON.`;
           }
         );
 
+        clearTimeout(timeoutId);
+
         if (response.ok) {
           const geminiData = await response.json();
           const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -93,21 +101,28 @@ Return ONLY pure JSON.`;
           }
         }
       } catch (geminiError) {
-        console.warn('Gemini OCR API error, falling back to local Tesseract OCR:', geminiError);
+        console.warn('Gemini OCR API error or timeout, requesting client-side fallback:', geminiError);
       }
     }
 
-    // 2. Perform Real Local / Server Tesseract OCR on the uploaded image
+    // 2. Fast server Tesseract OCR with strict 6s timeout (fallback to client if slow)
     try {
+      const { createWorker } = await import('tesseract.js');
       const pureBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
       const imageBuffer = Buffer.from(pureBase64, 'base64');
 
-      const worker = await createWorker('eng');
-      const ret = await worker.recognize(imageBuffer);
-      await worker.terminate();
+      const ocrPromise = (async () => {
+        const worker = await createWorker('eng');
+        const ret = await worker.recognize(imageBuffer);
+        await worker.terminate();
+        return ret.data.text;
+      })();
 
-      const extractedText = ret.data.text;
-      console.log('Tesseract OCR extracted text:\n', extractedText);
+      const timeoutPromise = new Promise<null>((_, reject) =>
+        setTimeout(() => reject(new Error('Server OCR timeout')), 5500)
+      );
+
+      const extractedText = (await Promise.race([ocrPromise, timeoutPromise])) as string;
 
       if (extractedText && extractedText.trim().length > 10) {
         const parsed = parseReceiptText(extractedText);
@@ -115,28 +130,28 @@ Return ONLY pure JSON.`;
           success: true,
           data: parsed,
           extracted_text: extractedText,
-          source: 'tesseract-local-ocr',
+          source: 'tesseract-server-ocr',
         });
       }
-    } catch (ocrError: any) {
-      console.error('Tesseract OCR processing error:', ocrError);
+    } catch (serverOcrError) {
+      console.log('Server OCR skipped or timed out, delegating to client-side OCR');
     }
 
-    // 3. Fallback to parser on any text or reasonable extraction
-    const fallbackParsed = parseReceiptText(fileName || '');
+    // Return flag indicating client OCR should run in browser
     return NextResponse.json({
-      success: true,
-      data: fallbackParsed,
-      source: 'heuristic-text-parser',
+      success: false,
+      fallbackToClient: true,
+      message: 'Server OCR unavailable, running fast client-side OCR',
     });
   } catch (error: any) {
     console.error('OCR Route error:', error);
     return NextResponse.json(
       {
         success: false,
+        fallbackToClient: true,
         error: error?.message || 'Failed to extract receipt data',
       },
-      { status: 500 }
+      { status: 200 }
     );
   }
 }

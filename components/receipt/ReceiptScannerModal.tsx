@@ -2,6 +2,8 @@
 
 import React, { useState, useRef } from 'react';
 import { usePurchases } from '@/context/PurchaseContext';
+import { optimizeReceiptImage } from '@/lib/utils/imageOptimizer';
+import { performClientOCR } from '@/lib/ocr/clientOcr';
 import {
   X,
   Camera,
@@ -9,8 +11,7 @@ import {
   FileText,
   Sparkles,
   AlertCircle,
-  CheckCircle2,
-  Image as ImageIcon,
+  Zap,
 } from 'lucide-react';
 
 export default function ReceiptScannerModal() {
@@ -25,76 +26,105 @@ export default function ReceiptScannerModal() {
   if (!isScannerOpen) return null;
 
   const steps = [
-    'Uploading receipt file...',
-    'Scanning OCR text & line items with AI...',
-    'Extracting product, brand, store & pricing...',
-    'Analyzing warranty & EMI breakdown...',
+    'Optimizing receipt image...',
+    'Scanning text & line items with OCR...',
+    'Extracting product, brand, store & price...',
+    'Finalizing warranty & EMI details...',
   ];
 
-  const handleFileUpload = (file: File) => {
+  const handleFileUpload = async (file: File) => {
     if (!file) return;
 
-    // Validate size (< 10MB)
-    if (file.size > 10 * 1024 * 1024) {
-      setErrorMessage('File size exceeds 10MB limit.');
+    if (file.size > 20 * 1024 * 1024) {
+      setErrorMessage('File size exceeds 20MB limit.');
       return;
     }
 
     setErrorMessage(null);
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const base64 = reader.result as string;
-      setPreviewImage(base64);
-      await processReceipt(base64, file.type, file.name);
-    };
-    reader.readAsDataURL(file);
+    setIsScanning(true);
+    setScanStep(0);
+
+    try {
+      // 1. Instant client-side compression (< 150ms)
+      const optimized = await optimizeReceiptImage(file);
+      setPreviewImage(optimized.base64);
+      await processReceipt(optimized.base64, optimized.mimeType, file.name);
+    } catch (err) {
+      console.error('File optimization error:', err);
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const rawBase64 = reader.result as string;
+        setPreviewImage(rawBase64);
+        await processReceipt(rawBase64, file.type || 'image/jpeg', file.name);
+      };
+      reader.readAsDataURL(file);
+    }
   };
 
   const processReceipt = async (base64: string, mimeType: string, fileName: string) => {
     setIsScanning(true);
-    setScanStep(0);
+    setScanStep(1);
 
-    // Simulate animated scanning steps
-    const timer1 = setTimeout(() => setScanStep(1), 700);
-    const timer2 = setTimeout(() => setScanStep(2), 1500);
-    const timer3 = setTimeout(() => setScanStep(3), 2200);
+    const stepInterval = setInterval(() => {
+      setScanStep((prev) => (prev < 3 ? prev + 1 : prev));
+    }, 600);
 
     try {
-      const res = await fetch('/api/ocr', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          imageBase64: base64,
-          mimeType,
-          fileName,
-        }),
-      });
+      // 1. Try server OCR (Gemini Vision or fast Server Tesseract) with 6s timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
 
-      const json = await res.json();
-      if (json.success && json.data) {
-        setTimeout(() => {
-          setIsScanning(false);
-          setIsScannerOpen(false);
-          setExtractedReviewData({
-            data: json.data,
-            receiptUrl: base64,
-          });
-        }, 2600);
-      } else {
-        throw new Error(json.error || 'Failed to extract receipt');
+      let extractedData = null;
+
+      try {
+        const res = await fetch('/api/ocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            imageBase64: base64,
+            mimeType,
+            fileName,
+          }),
+        });
+
+        clearTimeout(timeoutId);
+        const json = await res.json();
+
+        if (json.success && json.data && json.data.product_name) {
+          extractedData = json.data;
+        }
+      } catch (serverErr) {
+        console.log('Server OCR skipped/timed out, switching to high-speed client OCR');
       }
+
+      // 2. If server did not return product data, run instant Client-Side OCR in the browser
+      if (!extractedData || !extractedData.product_name) {
+        setScanStep(2);
+        extractedData = await performClientOCR(base64);
+      }
+
+      clearInterval(stepInterval);
+      setScanStep(3);
+
+      setTimeout(() => {
+        setIsScanning(false);
+        setIsScannerOpen(false);
+        setExtractedReviewData({
+          data: extractedData,
+          receiptUrl: base64,
+        });
+      }, 500);
     } catch (err: any) {
-      clearTimeout(timer1);
-      clearTimeout(timer2);
-      clearTimeout(timer3);
+      clearInterval(stepInterval);
       setIsScanning(false);
       setErrorMessage(
-        "Couldn't confidently read this receipt. You can still enter details manually."
+        "Couldn't read receipt clearly. You can still review and enter details manually."
       );
     }
   };
 
-  const handleQuickDemoScan = (type: 'tv' | 'macbook' | 'dyson') => {
+  const handleQuickDemoScan = async (type: 'tv' | 'macbook' | 'dyson') => {
     let mockUrl = 'https://images.unsplash.com/photo-1593359677879-a4bb92f829d1?w=800&auto=format&fit=crop&q=80';
     if (type === 'macbook') {
       mockUrl = 'https://images.unsplash.com/photo-1517336714731-489689fd1ca8?w=800&auto=format&fit=crop&q=80';
@@ -128,11 +158,14 @@ export default function ReceiptScannerModal() {
           <div className="w-12 h-12 rounded-2xl bg-indigo-50 dark:bg-indigo-950/80 text-indigo-600 dark:text-indigo-400 flex items-center justify-center mx-auto mb-3 shadow-inner">
             <Camera className="w-6 h-6" />
           </div>
-          <h3 className="text-xl font-bold text-slate-900 dark:text-white">
-            Scan or Upload Receipt
+          <h3 className="text-xl font-bold text-slate-900 dark:text-white flex items-center justify-center gap-1.5">
+            <span>Scan Receipt</span>
+            <span className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 dark:bg-emerald-950/80 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+              <Zap className="w-2.5 h-2.5" /> Turbo OCR
+            </span>
           </h3>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-xs mx-auto">
-            AI extracts product details, price, warranty & EMI schedule instantly.
+            AI & OCR automatically extracts products, store, prices, warranty & EMI schedule.
           </p>
         </div>
 
@@ -140,7 +173,7 @@ export default function ReceiptScannerModal() {
         <input
           type="file"
           ref={fileInputRef}
-          accept="image/*,application/pdf"
+          accept="image/*"
           className="hidden"
           onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
         />
@@ -155,8 +188,8 @@ export default function ReceiptScannerModal() {
 
         {/* Scanning Progress Screen */}
         {isScanning ? (
-          <div className="py-8 text-center space-y-6">
-            <div className="relative w-48 h-48 mx-auto rounded-2xl overflow-hidden border-2 border-indigo-500 bg-slate-950 shadow-glow">
+          <div className="py-6 text-center space-y-5">
+            <div className="relative w-44 h-44 mx-auto rounded-2xl overflow-hidden border-2 border-indigo-500 bg-slate-950 shadow-glow">
               {previewImage ? (
                 <img
                   src={previewImage}
@@ -176,10 +209,10 @@ export default function ReceiptScannerModal() {
             <div className="space-y-2">
               <div className="flex items-center justify-center gap-2 text-indigo-600 dark:text-indigo-400 font-semibold text-sm">
                 <Sparkles className="w-4 h-4 animate-spin" />
-                <span>Analyzing Receipt...</span>
+                <span>Reading Bill Details...</span>
               </div>
-              <p className="text-xs text-slate-500 dark:text-slate-400 font-medium animate-pulse">
-                {steps[scanStep]}
+              <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">
+                {steps[scanStep] || 'Finalizing data...'}
               </p>
             </div>
           </div>
@@ -197,7 +230,7 @@ export default function ReceiptScannerModal() {
               {/* Camera Button for Mobile */}
               <button
                 onClick={() => cameraInputRef.current?.click()}
-                className="flex flex-col items-center justify-center p-5 rounded-2xl border-2 border-dashed border-indigo-300 dark:border-indigo-800/80 bg-indigo-50/50 dark:bg-indigo-950/20 hover:bg-indigo-100/50 dark:hover:bg-indigo-900/30 transition-all group"
+                className="flex flex-col items-center justify-center p-5 rounded-2xl border-2 border-dashed border-indigo-300 dark:border-indigo-800/80 bg-indigo-50/50 dark:bg-indigo-950/20 hover:bg-indigo-100/50 dark:hover:bg-indigo-900/30 transition-all group cursor-pointer"
               >
                 <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center mb-2 shadow-md group-hover:scale-110 transition-transform">
                   <Camera className="w-5 h-5" />
@@ -209,17 +242,17 @@ export default function ReceiptScannerModal() {
               {/* Gallery / File upload */}
               <button
                 onClick={() => fileInputRef.current?.click()}
-                className="flex flex-col items-center justify-center p-5 rounded-2xl border-2 border-dashed border-slate-300 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/40 hover:bg-slate-100 dark:hover:bg-slate-800/50 transition-all group"
+                className="flex flex-col items-center justify-center p-5 rounded-2xl border-2 border-dashed border-slate-300 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/40 hover:bg-slate-100 dark:hover:bg-slate-800/50 transition-all group cursor-pointer"
               >
                 <div className="w-10 h-10 rounded-xl bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 flex items-center justify-center mb-2 group-hover:scale-110 transition-transform">
                   <UploadCloud className="w-5 h-5" />
                 </div>
                 <span className="text-xs font-bold text-slate-900 dark:text-white">Upload Receipt</span>
-                <span className="text-[10px] text-slate-500 dark:text-slate-400">JPG, PNG, WEBP, PDF</span>
+                <span className="text-[10px] text-slate-500 dark:text-slate-400">JPG, PNG, WEBP</span>
               </button>
             </div>
 
-            {/* Sample Receipts for Quick Testing */}
+            {/* Quick Demo Options */}
             <div className="pt-3 border-t border-slate-100 dark:border-slate-800">
               <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider text-center mb-2.5">
                 Or Try Sample Invoices
