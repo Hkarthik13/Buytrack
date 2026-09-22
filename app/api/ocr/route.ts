@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
     // 1. If Gemini API key is available, use ultra-fast Gemini Vision (< 1.2s)
     if (apiKey && apiKey !== 'your-gemini-api-key' && apiKey.trim().length > 10) {
       try {
-        const pureBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+        const pureBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
 
         const systemPrompt = `You are a high-precision financial receipt OCR scanner.
 Analyze the given receipt image and extract structured data in strict JSON format.
@@ -89,7 +89,8 @@ Return ONLY pure JSON.`;
           const geminiData = await response.json();
           const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
           if (rawText) {
-            const parsed = JSON.parse(rawText) as ExtractedReceiptData;
+            const jsonText = rawText.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+            const parsed = JSON.parse(jsonText) as ExtractedReceiptData;
             return NextResponse.json({
               success: true,
               data: {
@@ -107,19 +108,25 @@ Return ONLY pure JSON.`;
 
     // 2. Fast server Tesseract OCR with strict 6s timeout (fallback to client if slow)
     try {
-      const { createWorker } = await import('tesseract.js');
-      const pureBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+      const { createWorker, PSM } = await import('tesseract.js');
+      const pureBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
       const imageBuffer = Buffer.from(pureBase64, 'base64');
 
       const ocrPromise = (async () => {
         const worker = await createWorker('eng');
+        if (typeof worker.setParameters === 'function') {
+          await worker.setParameters({
+            preserve_interword_spaces: '1',
+            tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+          });
+        }
         const ret = await worker.recognize(imageBuffer);
         await worker.terminate();
         return ret.data.text;
       })();
 
       const timeoutPromise = new Promise<null>((_, reject) =>
-        setTimeout(() => reject(new Error('Server OCR timeout')), 5500)
+        setTimeout(() => reject(new Error('Server OCR timeout')), 8500)
       );
 
       const extractedText = (await Promise.race([ocrPromise, timeoutPromise])) as string;

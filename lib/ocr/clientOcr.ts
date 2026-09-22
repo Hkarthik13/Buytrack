@@ -1,4 +1,4 @@
-import { createWorker } from 'tesseract.js';
+import { createWorker, PSM } from 'tesseract.js';
 import { parseReceiptText } from './receiptParser';
 import { ExtractedReceiptData } from '@/types/database';
 
@@ -8,6 +8,12 @@ async function getWorker() {
   if (!workerPromise) {
     workerPromise = (async () => {
       const worker = await createWorker('eng');
+      if (typeof worker.setParameters === 'function') {
+        await worker.setParameters({
+          preserve_interword_spaces: '1',
+          tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+        });
+      }
       return worker;
     })();
   }

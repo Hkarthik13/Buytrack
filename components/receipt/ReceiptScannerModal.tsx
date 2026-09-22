@@ -14,6 +14,17 @@ import {
   Zap,
 } from 'lucide-react';
 
+function isUsableExtraction(data: any) {
+  if (!data) return false;
+  const hasRealProduct = Boolean(data.product_name && data.product_name !== 'Purchased Item');
+  const hasPrice = Number(data.final_price || data.original_price || 0) > 0;
+  const hasSeller = Boolean(data.store && data.store !== 'Retail Store');
+  const hasBrand = Boolean(data.brand && data.brand !== 'Unknown Brand');
+  const confidence = Number(data.confidence_score || 0);
+
+  return confidence >= 0.72 || (hasRealProduct && hasPrice) || (hasPrice && (hasSeller || hasBrand));
+}
+
 export default function ReceiptScannerModal() {
   const { isScannerOpen, setIsScannerOpen, setExtractedReviewData } = usePurchases();
   const [isScanning, setIsScanning] = useState(false);
@@ -70,9 +81,9 @@ export default function ReceiptScannerModal() {
     }, 600);
 
     try {
-      // 1. Try server OCR (Gemini Vision or fast Server Tesseract) with 6s timeout
+      // 1. Try server OCR first, but only accept it when the parsed fields are strong.
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000);
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
 
       let extractedData = null;
 
@@ -91,15 +102,17 @@ export default function ReceiptScannerModal() {
         clearTimeout(timeoutId);
         const json = await res.json();
 
-        if (json.success && json.data && json.data.product_name) {
+        if (json.success && isUsableExtraction(json.data)) {
           extractedData = json.data;
         }
       } catch (serverErr) {
-        console.log('Server OCR skipped/timed out, switching to high-speed client OCR');
+        console.log('Server OCR skipped/timed out, switching to client OCR');
+      } finally {
+        clearTimeout(timeoutId);
       }
 
-      // 2. If server did not return product data, run instant Client-Side OCR in the browser
-      if (!extractedData || !extractedData.product_name) {
+      // 2. If server did not return usable data, run client-side OCR as a second pass.
+      if (!isUsableExtraction(extractedData)) {
         setScanStep(2);
         extractedData = await performClientOCR(base64);
       }

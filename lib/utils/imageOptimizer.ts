@@ -1,8 +1,8 @@
 /**
- * Compresses and optimizes receipt images for ultra-fast OCR scanning.
- * Reduces 10MB phone camera photos to lightweight, crisp ~200KB images.
+ * Compresses and enhances receipt images for OCR scanning.
+ * Keeps text resolution high enough for small receipt fonts while reducing huge phone photos.
  */
-export async function optimizeReceiptImage(fileOrBase64: File | string, maxDimension = 1400): Promise<{
+export async function optimizeReceiptImage(fileOrBase64: File | string, maxDimension = 1800): Promise<{
   base64: string;
   mimeType: string;
 }> {
@@ -41,13 +41,28 @@ export async function optimizeReceiptImage(fileOrBase64: File | string, maxDimen
         return;
       }
 
-      // Draw with white background (in case of transparent PNG)
+      // Draw with white background in case of transparent PNGs.
       ctx.fillStyle = '#FFFFFF';
       ctx.fillRect(0, 0, width, height);
       ctx.drawImage(img, 0, 0, width, height);
 
-      // High-contrast clean image for OCR
-      const optimizedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      const imageData = ctx.getImageData(0, 0, width, height);
+      const data = imageData.data;
+
+      for (let i = 0; i < data.length; i += 4) {
+        const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.28 + 142));
+        data[i] = contrasted;
+        data[i + 1] = contrasted;
+        data[i + 2] = contrasted;
+      }
+
+      ctx.putImageData(imageData, 0, 0);
+      ctx.filter = 'contrast(1.08) brightness(1.03)';
+      ctx.drawImage(canvas, 0, 0);
+      ctx.filter = 'none';
+
+      const optimizedDataUrl = canvas.toDataURL('image/jpeg', 0.92);
       resolve({
         base64: optimizedDataUrl,
         mimeType: 'image/jpeg',
